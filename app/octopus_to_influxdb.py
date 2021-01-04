@@ -31,7 +31,7 @@ def retrieve_paginated_data(
     return results
 
 
-def store_series(connection, series, metrics, rate_data):
+def store_series(connection, series, metrics, rate_data, dryrun):
 
     agile_data = rate_data.get('agile_unit_rates', [])
     agile_rates = {
@@ -97,24 +97,40 @@ def store_series(connection, series, metrics, rate_data):
             })
         return fields
 
-    def tags_for_measurement(measurement):
-        period = maya.parse(measurement['interval_end'])
+    def tags_for_measurement(interval_end):
+        period = maya.parse(interval_end)
         time = period.datetime().strftime('%H:%M')
         return {
-            'active_rate': active_rate_field(measurement),
             'time_of_day': time,
         }
 
     measurements = [
         {
             'measurement': series,
-            'tags': tags_for_measurement(measurement),
+            'tags': tags_for_measurement(measurement['interval_end']),
             'time': measurement['interval_end'],
-            'fields': fields_for_measurement(measurement),
+            'fields': fields_for_measurement(measurement)
         }
         for measurement in metrics
     ]
-    connection.write_points(measurements)
+
+    already_added = set((measurement['time'] for measurement in measurements))
+    agile_rates_only = [
+        {
+            'measurement': series,
+            'tags': tags_for_measurement(agile_period_end),
+            'time': agile_period_end,
+            'fields': { 'agile_rate' : agile_rates[agile_period_end] }
+        } 
+        for agile_period_end in agile_rates
+    ]
+
+    measurements += agile_rates_only
+
+    if dryrun:
+        print("\n".join(f"would write {measurement}" for measurement in measurements))
+    else:
+        connection.write_points(measurements)
 
 
 @click.command()
@@ -125,10 +141,13 @@ def store_series(connection, series, metrics, rate_data):
 )
 @click.option('--from-date', default='yesterday midnight', type=click.STRING)
 @click.option('--to-date', default='today midnight', type=click.STRING)
-def cmd(config_file, from_date, to_date):
+@click.option('--dryrun/--not-dryrun', default=False)
+def cmd(config_file, from_date, to_date, dryrun):
 
     config = ConfigParser()
     config.read(config_file)
+
+    include_gas = "gas" in config
 
     influx = InfluxDBClient(
         host=config.get('influxdb', 'host', fallback="localhost"),
@@ -150,15 +169,16 @@ def cmd(config_file, from_date, to_date):
             f'{e_mpan}/meters/{e_serial}/consumption/'
     agile_url = config.get('electricity', 'agile_rate_url', fallback=None)
 
-    g_mpan = config.get('gas', 'mpan', fallback=None)
-    g_serial = config.get('gas', 'serial_number', fallback=None)
-    g_meter_type = config.get('gas', 'meter_type', fallback=1)
-    g_vcf = config.get('gas', 'volume_correction_factor', fallback=1.02264)
-    g_cv = config.get('gas', 'calorific_value', fallback=40)
-    if not g_mpan or not g_serial:
-        raise click.ClickException('No gas meter identifiers')
-    g_url = 'https://api.octopus.energy/v1/gas-meter-points/' \
-            f'{g_mpan}/meters/{g_serial}/consumption/'
+    if include_gas:
+        g_mpan = config.get('gas', 'mpan', fallback=None)
+        g_serial = config.get('gas', 'serial_number', fallback=None)
+        g_meter_type = config.get('gas', 'meter_type', fallback=1)
+        g_vcf = config.get('gas', 'volume_correction_factor', fallback=1.02264)
+        g_cv = config.get('gas', 'calorific_value', fallback=40)
+        if not g_mpan or not g_serial:
+            raise click.ClickException('No gas meter identifiers')
+        g_url = 'https://api.octopus.energy/v1/gas-meter-points/' \
+                f'{g_mpan}/meters/{g_serial}/consumption/'
 
     timezone = config.get('electricity', 'unit_rate_low_zone', fallback=None)
 
@@ -185,7 +205,10 @@ def cmd(config_file, from_date, to_date):
             ),
             'agile_unit_rates': [],
         },
-        'gas': {
+    }
+
+    if include_gas:
+       rate_data['gas'] = {
             'standing_charge': config.getfloat(
                 'gas', 'standing_charge', fallback=0.0
             ),
@@ -193,7 +216,6 @@ def cmd(config_file, from_date, to_date):
             # SMETS1 meters report kWh, SMET2 report m^3 and need converting to kWh first
             'conversion_factor': (float(g_vcf) * float(g_cv)) / 3.6 if int(g_meter_type) > 1 else None,
         }
-    }
 
     from_iso = maya.when(from_date, timezone=timezone).iso8601()
     to_iso = maya.when(to_date, timezone=timezone).iso8601()
@@ -214,17 +236,18 @@ def cmd(config_file, from_date, to_date):
         api_key, agile_url, from_iso, to_iso
     )
     click.echo(f' {len(rate_data["electricity"]["agile_unit_rates"])} rates.')
-    store_series(influx, 'electricity', e_consumption, rate_data['electricity'])
+    store_series(influx, 'electricity', e_consumption, rate_data['electricity'], dryrun)
 
-    click.echo(
-        f'Retrieving gas data for {from_iso} until {to_iso}...',
-        nl=False
-    )
-    g_consumption = retrieve_paginated_data(
-        api_key, g_url, from_iso, to_iso
-    )
-    click.echo(f' {len(g_consumption)} readings.')
-    store_series(influx, 'gas', g_consumption, rate_data['gas'])
+    if include_gas:
+        click.echo(
+            f'Retrieving gas data for {from_iso} until {to_iso}...',
+            nl=False
+        )
+        g_consumption = retrieve_paginated_data(
+            api_key, g_url, from_iso, to_iso
+        )
+        click.echo(f' {len(g_consumption)} readings.')
+        store_series(influx, 'gas', g_consumption, rate_data['gas'], dryrun)
 
 
 if __name__ == '__main__':
